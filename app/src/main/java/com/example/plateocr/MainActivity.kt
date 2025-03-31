@@ -2,7 +2,7 @@ package com.example.plateocr
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
+
 import android.graphics.BitmapFactory
 import android.net.Uri
 import android.os.Bundle
@@ -24,11 +24,11 @@ import androidx.compose.ui.unit.dp
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.google.mlkit.vision.text.TextRecognition
-import com.google.mlkit.vision.text.TextRecognizer
+
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.File
-import java.io.FileWriter
+
 import java.io.IOException
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -45,6 +45,15 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.Dispatchers
 
+import android.content.ContentValues
+import android.provider.MediaStore
+import android.os.Build
+import android.content.Intent
+
+import android.app.Activity
+import android.provider.OpenableColumns
+import java.io.OutputStream
+
 class MainActivity : ComponentActivity() {
     private lateinit var cameraExecutor: ExecutorService
     private lateinit var cameraProvider: ProcessCameraProvider
@@ -52,6 +61,9 @@ class MainActivity : ComponentActivity() {
     private var imageCapture: ImageCapture? = null
     private lateinit var database: AppDatabase
     private lateinit var plateDao: PlateDao
+
+    private val EXPORT_CSV_REQUEST_CODE = 1001  // For CSV export
+    private val REQUEST_CODE_PERMISSIONS = 10   // You already have this one
 
     // State for dialogs
     private var showConfirmationDialog by mutableStateOf(false)
@@ -160,25 +172,129 @@ class MainActivity : ComponentActivity() {
         }, ContextCompat.getMainExecutor(this))
     }
 
-    // Function to take a picture
-    private fun takePicture() {
-        val imageCapture = imageCapture ?: return
 
-        val file = File(externalMediaDirs.first(), "${System.currentTimeMillis()}.jpg")
-        val outputOptions = ImageCapture.OutputFileOptions.Builder(file).build()
+// Modified takePicture function
+private fun takePicture() {
+    val imageCapture = imageCapture ?: return
 
-        imageCapture.takePicture(
-            outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
-                override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                    processImage(file)
-                }
-
-                override fun onError(exception: ImageCaptureException) {
-                    Log.e("Camera", "Error capturing image: ${exception.message}")
-                }
+    try {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            // Android 10+ (API 29+) approach using MediaStore
+            val contentValues = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, "plate_${System.currentTimeMillis()}")
+                put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/Camera")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
             }
-        )
+
+            val contentResolver = applicationContext.contentResolver
+            val uri = contentResolver.insert(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                contentValues
+            ) ?: throw IOException("Failed to create new MediaStore record.")
+
+            // Create output options using the file descriptor approach
+            val outputStream = contentResolver.openOutputStream(uri)
+                ?: throw IOException("Failed to get output stream")
+
+            val outputOptions = ImageCapture.OutputFileOptions.Builder(outputStream).build()
+
+            imageCapture.takePicture(
+                outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                        // Update IS_PENDING flag
+                        contentValues.clear()
+                        contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                        contentResolver.update(uri, contentValues, null, null)
+
+                        // Process the image
+                        val file = uriToFile(uri)
+                        processImage(file)
+                    }
+
+                    override fun onError(exception: ImageCaptureException) {
+                        Log.e("Camera", "Error capturing image: ${exception.message}")
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Error capturing image",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                        // Clean up the failed entry
+                        contentResolver.delete(uri, null, null)
+                    }
+                }
+            )
+        } else {
+            // Pre-Android 10 approach using direct file access
+            @Suppress("DEPRECATION")
+            val picturesDir = Environment.getExternalStoragePublicDirectory(
+                Environment.DIRECTORY_DCIM + "/Camera"
+            )
+            if (!picturesDir.exists()) {
+                picturesDir.mkdirs()
+            }
+            val file = File(picturesDir, "plate_${System.currentTimeMillis()}.jpg")
+            val outputOptions = ImageCapture.OutputFileOptions.Builder(file).build()
+
+            imageCapture.takePicture(
+                outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
+                    override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
+                        // Notify gallery
+                        sendBroadcast(
+                            Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE).apply {
+                                data = Uri.fromFile(file)
+                            }
+                        )
+                        processImage(file)
+                    }
+
+                    override fun onError(exception: ImageCaptureException) {
+                        Log.e("Camera", "Error capturing image: ${exception.message}")
+                        Toast.makeText(
+                            this@MainActivity,
+                            "Error capturing image",
+                            Toast.LENGTH_SHORT
+                        ).show()
+                    }
+                }
+            )
+        }
+    } catch (e: Exception) {
+        Log.e("Camera", "Error setting up capture: ${e.message}")
+        Toast.makeText(
+            this@MainActivity,
+            "Error setting up capture: ${e.message}",
+            Toast.LENGTH_SHORT
+        ).show()
     }
+}
+    private fun uriToFile(uri: Uri): File {
+        return when {
+            // For Android Q and above, use the URI directly with ContentResolver
+            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
+                val inputStream = contentResolver.openInputStream(uri)
+                val tempFile = File.createTempFile("plate_temp", ".jpg", cacheDir)
+                inputStream?.use { input ->
+                    tempFile.outputStream().use { output ->
+                        input.copyTo(output)
+                    }
+                }
+                tempFile
+            }
+            // For older versions, get the file path from the URI
+            else -> {
+                val filePathColumn = arrayOf(MediaStore.Images.Media.DATA)
+                val cursor = contentResolver.query(uri, filePathColumn, null, null, null)
+                cursor?.use {
+                    it.moveToFirst()
+                    val columnIndex = it.getColumnIndex(filePathColumn[0])
+                    val filePath = it.getString(columnIndex)
+                    File(filePath)
+                } ?: throw IOException("Could not get file path from URI")
+            }
+        }
+    }
+
 
     // Process image and do OCR, then check database
     private fun processImage(file: File) {
@@ -259,33 +375,41 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun exportPlatesToCsv() {
-        lifecycleScope.launch(Dispatchers.IO) {
-            val plates = plateDao.getAllPlates()
-            if (plates.isNotEmpty()) {
-                try {
-                    val csvFile = File(getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS), "plates.csv")
-                    FileWriter(csvFile).use { writer ->
-                        writer.append("Number,Label\n")
-                        for (plate in plates) {
-                            writer.append("${plate.number},${plate.label}\n")
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "text/csv"
+            putExtra(Intent.EXTRA_TITLE, "plate_records.csv")
+        }
+        startActivityForResult(intent, EXPORT_CSV_REQUEST_CODE)
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)  // Important!
+
+        if (requestCode == EXPORT_CSV_REQUEST_CODE && resultCode == Activity.RESULT_OK) {
+            data?.data?.let { uri ->
+                lifecycleScope.launch(Dispatchers.IO) {
+                    try {
+                        val plates = plateDao.getAllPlates()
+                        contentResolver.openOutputStream(uri)?.use { stream ->
+                            stream.write("Number,Label\n".toByteArray())
+                            plates.forEach { plate ->
+                                stream.write("\"${plate.number}\",\"${plate.label}\"\n".toByteArray())
+                            }
+                        }
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(this@MainActivity, "Export successful!", Toast.LENGTH_SHORT).show()
+                        }
+                    } catch (e: Exception) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(this@MainActivity, "Export failed: ${e.message}", Toast.LENGTH_LONG).show()
                         }
                     }
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(this@MainActivity, "Plates exported to ${csvFile.absolutePath}", Toast.LENGTH_LONG).show()
-                    }
-                } catch (e: IOException) {
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(this@MainActivity, "Error exporting to CSV: ${e.message}", Toast.LENGTH_SHORT).show()
-                    }
-                    Log.e("CSV Export", "Error writing CSV file", e)
-                }
-            } else {
-                withContext(Dispatchers.Main) {
-                    Toast.makeText(this@MainActivity, "No plates found in the database to export.", Toast.LENGTH_SHORT).show()
                 }
             }
         }
     }
+
 
     override fun onDestroy() {
         super.onDestroy()
