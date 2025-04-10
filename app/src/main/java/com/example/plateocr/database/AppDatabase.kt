@@ -25,5 +25,12 @@ abstract class AppDatabase : RoomDatabase() {
                 instance
             }
         }
+
+        // Add this function with proper naming
+        @Synchronized
+        fun resetInstance() {
+            INSTANCE?.close()
+            INSTANCE = null
+        }
     }
 }

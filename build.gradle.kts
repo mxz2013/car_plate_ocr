@@ -1,14 +1,10 @@
 // Top-level build file where you can add configuration options common to all sub-projects/modules.
 plugins {
+    // Use alias from libs.versions.toml for consistency
+    alias(libs.plugins.android.application) apply false
     alias(libs.plugins.kotlin.android) apply false
-    alias(libs.plugins.kotlin.compose) apply false
-    id("com.android.application") version "8.2.2" apply false
-//    id("org.jetbrains.kotlin.android") version "1.9.22" apply false
+    // DO NOT APPLY COMPOSE PLUGIN HERE
 }
 
-buildscript {
-    dependencies {
-        classpath("com.android.tools.build:gradle:8.2.2") // Keep only if needed
-    }
-}
-
+// Remove the entire buildscript block - it's redundant with the plugins {} block above
+// buildscript { ... }

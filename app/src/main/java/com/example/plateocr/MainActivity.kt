@@ -1,71 +1,65 @@
 package com.example.plateocr
 
+import java.io.IOException
 import android.Manifest
+import android.app.AlertDialog
+import android.content.Intent
 import android.content.pm.PackageManager
-
-import android.graphics.BitmapFactory
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.provider.Settings
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
-import androidx.camera.core.*
+import androidx.activity.result.ActivityResultLauncher
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.camera.core.ImageCapture
+import androidx.camera.core.ImageCaptureException
+import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
-import androidx.compose.foundation.layout.*
-import androidx.compose.material.*
-import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
-import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.unit.dp
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
+import androidx.lifecycle.lifecycleScope
+import com.example.plateocr.database.AppDatabase
+import com.example.plateocr.database.Plate
+import com.example.plateocr.database.PlateDao
+import com.example.plateocr.ui.MainScreen
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
+import java.io.FileOutputStream
+import java.text.SimpleDateFormat
+import java.util.*
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import androidx.camera.core.CameraSelector
+import android.graphics.BitmapFactory
 import com.google.mlkit.vision.text.TextRecognition
+
 
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
-import java.io.File
-
-import java.io.IOException
-import java.util.concurrent.ExecutorService
-import java.util.concurrent.Executors
-import androidx.compose.ui.viewinterop.AndroidView
-import androidx.compose.ui.platform.LocalContext
-
-import com.example.plateocr.database.AppDatabase
-import com.example.plateocr.database.PlateDao
-import com.example.plateocr.database.Plate
 import com.google.mlkit.vision.text.Text
-
-import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
-import kotlinx.coroutines.Dispatchers
-
 import android.content.ContentValues
-import android.provider.MediaStore
-import android.os.Build
-import android.content.Intent
+import android.database.Cursor
+import android.graphics.Bitmap
 
-import android.app.Activity
-import android.provider.OpenableColumns
-import java.io.OutputStream
+
+import android.provider.MediaStore
+
 
 class MainActivity : ComponentActivity() {
-    private lateinit var cameraExecutor: ExecutorService
-    private lateinit var cameraProvider: ProcessCameraProvider
-    private var camera: Camera? = null
-    private var imageCapture: ImageCapture? = null
-    private lateinit var database: AppDatabase
-    private lateinit var plateDao: PlateDao
-
-    private val EXPORT_CSV_REQUEST_CODE = 1001  // For CSV export
-    private val REQUEST_CODE_PERMISSIONS = 10   // You already have this one
-
-    // State for dialogs
+    // State variables
     private var showConfirmationDialog by mutableStateOf(false)
     private var showLabelDialog by mutableStateOf(false)
     private var showSuccessDialog by mutableStateOf(false)
@@ -75,248 +69,328 @@ class MainActivity : ComponentActivity() {
     private var labelText by mutableStateOf("")
     private var existingPlateLabel by mutableStateOf("")
 
+    // Camera and permissions
+    private lateinit var cameraExecutor: ExecutorService
+    private lateinit var imageCapture: ImageCapture
+    private lateinit var fileProviderAuthority: String
+    private lateinit var permissionLauncher: ActivityResultLauncher<Array<String>>
+    private lateinit var requiredPermissions: Array<String>
+
+    // Database
+    private lateinit var database: AppDatabase
+    private lateinit var plateDao: PlateDao
+
+    override fun onResume() {
+        super.onResume()
+
+        if (this::permissionLauncher.isInitialized && checkPermissions()) {
+            initializeContent()
+        }
+    }
+
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Request camera permission if not granted
-        if (!allPermissionsGranted()) {
-            ActivityCompat.requestPermissions(
-                this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
-            )
+        // Initialize camera executor
+        cameraExecutor = Executors.newSingleThreadExecutor()
+
+        // Initialize Context-dependent properties
+        fileProviderAuthority = "$packageName.fileprovider"
+        requiredPermissions = buildRequiredPermissions()
+        permissionLauncher = registerForActivityResult(
+            ActivityResultContracts.RequestMultiplePermissions()
+        ) { permissions ->
+            if (permissions.all { it.value }) {
+                initializeContent()
+            } else {
+                showPermissionRationaleDialog()
+            }
         }
 
-        cameraExecutor = Executors.newSingleThreadExecutor()
         database = AppDatabase.getDatabase(this)
         plateDao = database.plateDao()
 
-        setContent {
-            MainScreen(
-                onCaptureClick = { if (allPermissionsGranted()) takePicture() else Toast.makeText(this, "Camera permission not granted.", Toast.LENGTH_SHORT).show() },
-                showConfirmationDialog = showConfirmationDialog,
-                showLabelDialog = showLabelDialog,
-                showSuccessDialog = showSuccessDialog,
-                showExistingLabelDialog = showExistingLabelDialog,
-                detectedText = detectedText,
-                correctedText = correctedText,
-                onCorrectedTextChange = { correctedText = it },
-                labelText = labelText,
-                onLabelTextChange = { labelText = it },
-                existingPlateLabel = existingPlateLabel,
-                onConfirmText = { confirmedText ->
-                    correctedText = confirmedText
-                    showConfirmationDialog = false
-                    checkIfPlateExists(confirmedText)
-                },
-                onConfirmLabel = { label ->
-                    labelText = label
-                    savePlateToDatabase()
-                    showLabelDialog = false
-                    showSuccessDialog = true
-                },
-                onDismissConfirmation = {
-                    showConfirmationDialog = false
-                },
-                onDismissLabel = {
-                    showLabelDialog = false
-                },
-                onDismissSuccess = {
-                    showSuccessDialog = false
-                },
-                onDismissExistingLabel = {
-                    showExistingLabelDialog = false
-                },
-                onExportCsvClick = { exportPlatesToCsv() }
+        if (checkPermissions()) {
+            initializeContent()
+        } else {
+            requestPermissions()
+        }
+    }
+
+    private fun buildRequiredPermissions(): Array<String> {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            arrayOf(
+                Manifest.permission.CAMERA,
+                Manifest.permission.READ_MEDIA_IMAGES
+            )
+        } else {
+            arrayOf(
+                Manifest.permission.CAMERA,
+                Manifest.permission.READ_EXTERNAL_STORAGE
             )
         }
     }
 
-    private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all {
-        ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED
+    private fun checkPermissions(): Boolean {
+        val result = requiredPermissions.all { permission ->
+            ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+        }
+        Log.d("Permissions", "checkPermissions result: $result")
+        return result
     }
 
-    override fun onRequestPermissionsResult(
-        requestCode: Int,
-        permissions: Array<String>,
-        grantResults: IntArray
-    ) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (requestCode == REQUEST_CODE_PERMISSIONS) {
-            if (!allPermissionsGranted()) {
-                Toast.makeText(this,
-                    "Permissions not granted by the user.",
-                    Toast.LENGTH_SHORT).show()
-                finish()
+    private fun shouldShowRationale(): Boolean {
+        return requiredPermissions.any { permission ->
+            ActivityCompat.shouldShowRequestPermissionRationale(this, permission)
+        }
+    }
+
+    private fun showPermissionRationaleDialog() {
+        AlertDialog.Builder(this)
+            .setTitle("Permissions Needed")
+            .setMessage("This app needs camera and storage permissions to function correctly. Please grant these permissions in the app settings.")
+            .setPositiveButton("Go to Settings") { _, _ ->
+                // Intent to open app settings
+                val intent = Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                val uri = Uri.fromParts("package", packageName, null)
+                intent.data = uri
+                startActivity(intent) // Consider using a launcher for result if needed
+                // Maybe finish the activity or disable functionality until permissions are granted
+            }
+            .setNegativeButton("Cancel") { _, _ ->
+                Toast.makeText(this, "Features may be limited or unavailable without permissions", Toast.LENGTH_LONG).show()
+                // Decide what to do here. Maybe initialize with limited functionality
+                // or show a message indicating limitations.
+                // Calling initializeContent() might still lead to crashes later
+                // if permissions are strictly required.
+                // finish() // Option: Close the app if permissions are essential
+            }
+            .setCancelable(false)
+            .show()
+    }
+
+    // Also, modify the requestPermissions logic slightly
+    private fun requestPermissions() {
+        // Check if rationale should be shown OR if permissions were denied permanently
+        // Note: A more robust check involves tracking if a request was already made.
+        // This simplified version handles the common case.
+        if (shouldShowRationale()) {
+            showPermissionRationaleDialog()
+        } else {
+            // If rationale shouldn't be shown (either first time, or denied with "don't ask again")
+            // just launch the request. If denied with "don't ask again", it won't pop up,
+            // and the result callback will indicate denial.
+            permissionLauncher.launch(requiredPermissions)
+        }
+    }
+
+    private fun initializeContent() {
+        setContent {
+            MaterialTheme {
+                MainScreen(
+                    onStartCamera = { initializeCamera(it) },
+                    onCaptureClick = { takePicture() },
+                    onExportCsvClick = { exportPlatesToCsv() },
+                    onBackupDbClick = { backupDatabase() },
+                    onRestoreDbClick = { restoreDatabase() },
+                    showConfirmationDialog = showConfirmationDialog,
+                    showLabelDialog = showLabelDialog,
+                    showSuccessDialog = showSuccessDialog,
+                    showExistingLabelDialog = showExistingLabelDialog,
+                    detectedText = detectedText,
+                    correctedText = correctedText,
+                    onCorrectedTextChange = { correctedText = it },
+                    labelText = labelText,
+                    onLabelTextChange = { labelText = it },
+                    existingPlateLabel = existingPlateLabel,
+                    onConfirmText = { confirmedText ->
+                        correctedText = confirmedText
+                        showConfirmationDialog = false
+                        checkIfPlateExists(confirmedText)
+                    },
+                    onConfirmLabel = { label ->
+                        labelText = label
+                        savePlateToDatabase()
+                        showLabelDialog = false
+                        showSuccessDialog = true
+                    },
+                    onDismissConfirmation = { showConfirmationDialog = false },
+                    onDismissLabel = { showLabelDialog = false },
+                    onDismissSuccess = { showSuccessDialog = false },
+                    onDismissExistingLabel = { showExistingLabelDialog = false }
+                )
             }
         }
     }
 
-    // Start the camera
-    internal fun startCamera(previewView: PreviewView) {
+    private fun initializeCamera(previewView: PreviewView) {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture.addListener({
-            cameraProvider = cameraProviderFuture.get()
-            val preview = Preview.Builder().build()
 
-            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-            imageCapture = ImageCapture.Builder().build()
-            preview.setSurfaceProvider(previewView.surfaceProvider)
+        cameraProviderFuture.addListener({
+            val cameraProvider: ProcessCameraProvider = cameraProviderFuture.get()
+
+            val preview = Preview.Builder()
+                .build()
+                .also {
+                    it.setSurfaceProvider(previewView.surfaceProvider)
+                }
+
+            imageCapture = ImageCapture.Builder()
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                .build()
 
             try {
+                // Unbind use cases before rebinding
                 cameraProvider.unbindAll()
-                camera = cameraProvider.bindToLifecycle(
-                    this, cameraSelector, preview, imageCapture
+
+                // Bind use cases to camera
+                cameraProvider.bindToLifecycle(
+                    this,
+                    CameraSelector.DEFAULT_BACK_CAMERA,
+                    preview,
+                    imageCapture
                 )
-            } catch (exc: Exception) {
+
+            } catch(exc: Exception) {
                 Log.e("Camera", "Use case binding failed", exc)
             }
         }, ContextCompat.getMainExecutor(this))
     }
-
-
-// Modified takePicture function
-private fun takePicture() {
-    val imageCapture = imageCapture ?: return
-
-    try {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // Android 10+ (API 29+) approach using MediaStore
-            val contentValues = ContentValues().apply {
-                put(MediaStore.MediaColumns.DISPLAY_NAME, "plate_${System.currentTimeMillis()}")
-                put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
-                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DCIM + "/Camera")
-                put(MediaStore.MediaColumns.IS_PENDING, 1)
-            }
-
-            val contentResolver = applicationContext.contentResolver
-            val uri = contentResolver.insert(
-                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
-                contentValues
-            ) ?: throw IOException("Failed to create new MediaStore record.")
-
-            // Create output options using the file descriptor approach
-            val outputStream = contentResolver.openOutputStream(uri)
-                ?: throw IOException("Failed to get output stream")
-
-            val outputOptions = ImageCapture.OutputFileOptions.Builder(outputStream).build()
-
-            imageCapture.takePicture(
-                outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
-                    override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                        // Update IS_PENDING flag
-                        contentValues.clear()
-                        contentValues.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                        contentResolver.update(uri, contentValues, null, null)
-
-                        // Process the image
-                        val file = uriToFile(uri)
-                        processImage(file)
-                    }
-
-                    override fun onError(exception: ImageCaptureException) {
-                        Log.e("Camera", "Error capturing image: ${exception.message}")
-                        Toast.makeText(
-                            this@MainActivity,
-                            "Error capturing image",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                        // Clean up the failed entry
-                        contentResolver.delete(uri, null, null)
-                    }
-                }
-            )
-        } else {
-            // Pre-Android 10 approach using direct file access
-            @Suppress("DEPRECATION")
-            val picturesDir = Environment.getExternalStoragePublicDirectory(
-                Environment.DIRECTORY_DCIM + "/Camera"
-            )
-            if (!picturesDir.exists()) {
-                picturesDir.mkdirs()
-            }
-            val file = File(picturesDir, "plate_${System.currentTimeMillis()}.jpg")
-            val outputOptions = ImageCapture.OutputFileOptions.Builder(file).build()
-
-            imageCapture.takePicture(
-                outputOptions, cameraExecutor, object : ImageCapture.OnImageSavedCallback {
-                    override fun onImageSaved(outputFileResults: ImageCapture.OutputFileResults) {
-                        // Notify gallery
-                        sendBroadcast(
-                            Intent(Intent.ACTION_MEDIA_SCANNER_SCAN_FILE).apply {
-                                data = Uri.fromFile(file)
-                            }
-                        )
-                        processImage(file)
-                    }
-
-                    override fun onError(exception: ImageCaptureException) {
-                        Log.e("Camera", "Error capturing image: ${exception.message}")
-                        Toast.makeText(
-                            this@MainActivity,
-                            "Error capturing image",
-                            Toast.LENGTH_SHORT
-                        ).show()
-                    }
-                }
-            )
-        }
-    } catch (e: Exception) {
-        Log.e("Camera", "Error setting up capture: ${e.message}")
-        Toast.makeText(
-            this@MainActivity,
-            "Error setting up capture: ${e.message}",
-            Toast.LENGTH_SHORT
-        ).show()
-    }
-}
-    private fun uriToFile(uri: Uri): File {
-        return when {
-            // For Android Q and above, use the URI directly with ContentResolver
-            Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> {
-                val inputStream = contentResolver.openInputStream(uri)
-                val tempFile = File.createTempFile("plate_temp", ".jpg", cacheDir)
-                inputStream?.use { input ->
-                    tempFile.outputStream().use { output ->
-                        input.copyTo(output)
-                    }
-                }
-                tempFile
-            }
-            // For older versions, get the file path from the URI
-            else -> {
-                val filePathColumn = arrayOf(MediaStore.Images.Media.DATA)
-                val cursor = contentResolver.query(uri, filePathColumn, null, null, null)
+    private fun getFileFromUri(uri: Uri): File? {
+        return try {
+            // Check if the URI points to an external file
+            if (uri.scheme == "content") {
+                val cursor = contentResolver.query(uri, arrayOf(MediaStore.Images.Media.DATA), null, null, null)
                 cursor?.use {
-                    it.moveToFirst()
-                    val columnIndex = it.getColumnIndex(filePathColumn[0])
-                    val filePath = it.getString(columnIndex)
-                    File(filePath)
-                } ?: throw IOException("Could not get file path from URI")
+                    if (it.moveToFirst()) {
+                        val columnIndex = it.getColumnIndex(MediaStore.Images.Media.DATA)
+                        val filePath = it.getString(columnIndex)
+                        File(filePath)
+                    } else {
+                        null
+                    }
+                }
+            } else {
+                // If it's a file URI, convert directly to File
+                File(uri.path)
             }
+        } catch (e: Exception) {
+            Log.e("Camera", "Error getting file from URI", e)
+            null
         }
     }
 
+    private fun takePicture() {
+        val imageCapture = imageCapture ?: return
+
+        val name = SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US)
+            .format(System.currentTimeMillis()) + ".jpg"
+
+        val contentValues = ContentValues().apply {
+            put(MediaStore.Images.Media.DISPLAY_NAME, name)
+            put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+            put(MediaStore.Images.Media.RELATIVE_PATH, Environment.DIRECTORY_PICTURES + "/PlateDetector")
+        }
+
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(
+            contentResolver,
+            MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+            contentValues
+        ).build()
+
+        imageCapture.takePicture(
+            outputOptions,
+            ContextCompat.getMainExecutor(this),
+            object : ImageCapture.OnImageSavedCallback {
+                override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                    val savedUri = output.savedUri ?: run {
+                        Log.e("Camera", "Saved URI is null")
+                        return
+                    }
+
+                    Toast.makeText(baseContext, "Photo capture succeeded", Toast.LENGTH_SHORT).show()
+                    processImage(savedUri)
+                }
+
+                override fun onError(exc: ImageCaptureException) {
+                    Log.e("Camera", "Photo capture failed: ${exc.message}", exc)
+                    Toast.makeText(baseContext, "Photo capture failed: ${exc.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+        )
+    }
+
+    private fun getImageContentUri(file: File): Uri? {
+        return try {
+            val contentResolver = applicationContext.contentResolver
+            val contentUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+
+            val projection = arrayOf(MediaStore.Images.Media._ID)
+            val selection = "${MediaStore.Images.Media.DATA} = ?"
+            val selectionArgs = arrayOf(file.absolutePath)
+
+            contentResolver.query(
+                contentUri,
+                projection,
+                selection,
+                selectionArgs,
+                null
+            )?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    val columnIndex = cursor.getColumnIndex(MediaStore.Images.Media._ID)
+                    if (columnIndex >= 0) {
+                        val id = cursor.getLong(columnIndex)
+                        Uri.withAppendedPath(contentUri, id.toString())
+                    } else {
+                        Log.e("Camera", "Column _ID not found in MediaStore query")
+                        null
+                    }
+                } else {
+                    null
+                }
+            }
+        } catch (e: Exception) {
+            Log.e("Camera", "Error getting content URI", e)
+            null
+        }
+    }
 
     // Process image and do OCR, then check database
-    private fun processImage(file: File) {
-        val bitmap = BitmapFactory.decodeFile(file.absolutePath)
-        val image = InputImage.fromBitmap(bitmap, 0)
+    private fun processImage(uri: Uri) {
+        try {
+            // Use contentResolver to directly get the image
+            val bitmap = contentResolver.openInputStream(uri)?.use { stream ->
+                BitmapFactory.decodeStream(stream)
+            }
 
-        val recognizer = TextRecognition.getClient(TextRecognizerOptions.Builder().build())
-        recognizer.process(image)
-            .addOnSuccessListener { visionText ->
-                val biggestText = findBiggestText(visionText)
-                if (biggestText.isNotEmpty()) {
-                    detectedText = biggestText
-                    correctedText = biggestText
-                    showConfirmationDialog = true
-                } else {
-                    Toast.makeText(this, "No text found in image", Toast.LENGTH_SHORT).show()
-                }
+            if (bitmap != null) {
+                val image = InputImage.fromBitmap(bitmap, 0)
+                val recognizer = TextRecognition.getClient(TextRecognizerOptions.Builder().build())
+
+                recognizer.process(image)
+                    .addOnSuccessListener { visionText ->
+                        val biggestText = findBiggestText(visionText)
+                        if (biggestText.isNotEmpty()) {
+                            detectedText = biggestText
+                            correctedText = biggestText
+                            showConfirmationDialog = true
+                        } else {
+                            Toast.makeText(this, "No text found in image", Toast.LENGTH_SHORT).show()
+                        }
+                    }
+                    .addOnFailureListener { e ->
+                        Log.e("OCR", "Text recognition failed: ${e.message}")
+                        Toast.makeText(this, "Text recognition failed", Toast.LENGTH_SHORT).show()
+                    }
+            } else {
+                Toast.makeText(this, "Failed to decode image", Toast.LENGTH_SHORT).show()
+                Log.e("ProcessImage", "Bitmap is null")
             }
-            .addOnFailureListener { e ->
-                Log.e("OCR", "Text recognition failed: ${e.message}")
-                Toast.makeText(this, "Text recognition failed", Toast.LENGTH_SHORT).show()
-            }
+        } catch (e: Exception) {
+            Toast.makeText(this, "Error processing image", Toast.LENGTH_SHORT).show()
+            Log.e("ProcessImage", "Exception while processing image from URI", e)
+        }
     }
 
     private fun findBiggestText(visionText: Text): String {
@@ -342,7 +416,9 @@ private fun takePicture() {
 
     private fun checkIfPlateExists(plateNumber: String) {
         lifecycleScope.launch {
-            val existingPlate = plateDao.getPlateByNumber(plateNumber)
+            val existingPlate = withContext(Dispatchers.IO) {
+                plateDao.getPlateByNumber(plateNumber)
+            }
             withContext(Dispatchers.Main) {
                 if (existingPlate != null) {
                     existingPlateLabel = existingPlate.label
@@ -359,12 +435,14 @@ private fun takePicture() {
             try {
                 val plate = Plate(
                     number = correctedText,
-                    label = labelText
+                    label = labelText,
+                    timestamp = System.currentTimeMillis()
                 )
-                plateDao.insert(plate)
+                withContext(Dispatchers.IO) {
+                    plateDao.insert(plate)
+                }
                 withContext(Dispatchers.Main) {
-                    Toast.makeText(this@MainActivity, "Saved successfully with label '$labelText'", Toast.LENGTH_SHORT).show()
-                    showSuccessDialog = false // Hide success dialog after a short delay or user interaction
+                    Toast.makeText(this@MainActivity, "Saved successfully", Toast.LENGTH_SHORT).show()
                 }
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
@@ -374,35 +452,117 @@ private fun takePicture() {
         }
     }
 
-    private fun exportPlatesToCsv() {
-        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "text/csv"
-            putExtra(Intent.EXTRA_TITLE, "plate_records.csv")
-        }
-        startActivityForResult(intent, EXPORT_CSV_REQUEST_CODE)
-    }
+    // Add a new ActivityResultLauncher for creating documents
+    private val createCsvLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("text/csv") // MIME type
+    ) { uri: Uri? ->
+        uri?.let { targetUri ->
+            lifecycleScope.launch(Dispatchers.IO) {
+                try {
+                    val plates = plateDao.getAllPlates()
+                    if (plates.isEmpty()) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(this@MainActivity, "No plates to export", Toast.LENGTH_SHORT).show()
+                        }
+                        return@launch
+                    }
 
-    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-        super.onActivityResult(requestCode, resultCode, data)  // Important!
-
-        if (requestCode == EXPORT_CSV_REQUEST_CODE && resultCode == Activity.RESULT_OK) {
-            data?.data?.let { uri ->
-                lifecycleScope.launch(Dispatchers.IO) {
-                    try {
-                        val plates = plateDao.getAllPlates()
-                        contentResolver.openOutputStream(uri)?.use { stream ->
-                            stream.write("Number,Label\n".toByteArray())
-                            plates.forEach { plate ->
-                                stream.write("\"${plate.number}\",\"${plate.label}\"\n".toByteArray())
-                            }
+                    // Write to the URI obtained from the user
+                    contentResolver.openOutputStream(targetUri)?.use { fos ->
+                        fos.write("Number,Label,Timestamp\n".toByteArray())
+                        plates.forEach { plate ->
+                            val line = "\"${plate.number}\",\"${plate.label}\",\"${plate.timestamp}\"\n"
+                            fos.write(line.toByteArray())
                         }
                         withContext(Dispatchers.Main) {
-                            Toast.makeText(this@MainActivity, "Export successful!", Toast.LENGTH_SHORT).show()
+                            Toast.makeText(this@MainActivity, "CSV exported successfully", Toast.LENGTH_SHORT).show()
+                        }
+                    } ?: throw IOException("Could not open output stream")
+
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@MainActivity, "Export failed: ${e.message}", Toast.LENGTH_LONG).show()
+                        Log.e("ExportCSV", "Error exporting CSV", e)
+                    }
+                }
+            }
+        } ?: run {
+            Toast.makeText(this, "Export cancelled", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun exportPlatesToCsv() {
+        val suggestedName = "plates_${System.currentTimeMillis()}.csv"
+        // Launch the SAF file creation intent
+        createCsvLauncher.launch(suggestedName)
+        // The rest of the logic moves inside the launcher's callback
+    }
+
+    // Add a new ActivityResultLauncher for creating documents
+    private val createDbBackupLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/x-sqlite3") // Or "application/octet-stream"
+    ) { uri: Uri? ->
+        uri?.let { backupUri ->
+            lifecycleScope.launch(Dispatchers.IO) {
+                try {
+                    val dbFile = getDatabasePath("plate_database")
+                    if (!dbFile.exists()) {
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(this@MainActivity, "Database file not found", Toast.LENGTH_SHORT).show()
+                        }
+                        return@launch
+                    }
+
+                    contentResolver.openOutputStream(backupUri)?.use { outputStream ->
+                        dbFile.inputStream().use { inputStream ->
+                            inputStream.copyTo(outputStream)
+                        }
+                    } ?: throw IOException("Could not open output stream for backup")
+
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@MainActivity, "Backup created successfully", Toast.LENGTH_SHORT).show()
+                    }
+                } catch (e: Exception) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@MainActivity, "Backup failed: ${e.message}", Toast.LENGTH_LONG).show()
+                        Log.e("BackupDB", "Error creating backup", e)
+                    }
+                }
+            }
+        } ?: run {
+            Toast.makeText(this, "Backup cancelled", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun backupDatabase() {
+        val suggestedName = "plate_db_backup_${System.currentTimeMillis()}.db"
+        // Launch the SAF file creation intent
+        createDbBackupLauncher.launch(suggestedName)
+        // The rest of the logic moves inside the launcher's callback
+    }
+
+    private val restoreDbLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == RESULT_OK) {
+            result.data?.data?.let { uri ->
+                lifecycleScope.launch(Dispatchers.IO) {
+                    try {
+                        database.close()
+                        val dbFile = getDatabasePath("plate_database")
+                        contentResolver.openInputStream(uri)?.use { input ->
+                            FileOutputStream(dbFile).use { output ->
+                                input.copyTo(output)
+                            }
+                        }
+                        database = AppDatabase.getDatabase(this@MainActivity)
+                        plateDao = database.plateDao()
+                        withContext(Dispatchers.Main) {
+                            Toast.makeText(this@MainActivity, "Database restored successfully", Toast.LENGTH_SHORT).show()
                         }
                     } catch (e: Exception) {
                         withContext(Dispatchers.Main) {
-                            Toast.makeText(this@MainActivity, "Export failed: ${e.message}", Toast.LENGTH_LONG).show()
+                            Toast.makeText(this@MainActivity, "Restore failed: ${e.message}", Toast.LENGTH_SHORT).show()
                         }
                     }
                 }
@@ -410,152 +570,16 @@ private fun takePicture() {
         }
     }
 
+    private fun restoreDatabase() {
+        Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "*/*"  // Allow all file types so user can choose any file
+        }.also { restoreDbLauncher.launch(it) }
+    }
+
 
     override fun onDestroy() {
         super.onDestroy()
-        cameraExecutor.shutdown()
-    }
-
-    companion object {
-        private const val REQUEST_CODE_PERMISSIONS = 10
-        private val REQUIRED_PERMISSIONS =
-            mutableListOf(
-                Manifest.permission.CAMERA
-            ).apply {
-                // Add other permissions if needed
-            }.toTypedArray()
-    }
-}
-
-@Composable
-fun MainScreen(
-    onCaptureClick: () -> Unit,
-    showConfirmationDialog: Boolean,
-    showLabelDialog: Boolean,
-    showSuccessDialog: Boolean,
-    showExistingLabelDialog: Boolean,
-    detectedText: String,
-    correctedText: String,
-    onCorrectedTextChange: (String) -> Unit,
-    labelText: String,
-    onLabelTextChange: (String) -> Unit,
-    existingPlateLabel: String,
-    onConfirmText: (String) -> Unit,
-    onConfirmLabel: (String) -> Unit,
-    onDismissConfirmation: () -> Unit,
-    onDismissLabel: () -> Unit,
-    onDismissSuccess: () -> Unit,
-    onDismissExistingLabel: () -> Unit,
-    onExportCsvClick: () -> Unit
-) {
-    val context = LocalContext.current
-    val previewView = remember { PreviewView(context) }
-
-    Column(
-        modifier = Modifier.fillMaxSize().padding(16.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterVertically)
-    ) {
-        Text("Capture a License Plate", color = Color.Black)
-
-        AndroidView(
-            factory = { previewView },
-            modifier = Modifier.fillMaxWidth().height(300.dp)
-        )
-
-        Button(onClick = onCaptureClick) {
-            Text("Capture Photo")
-        }
-
-        Button(onClick = onExportCsvClick) {
-            Text("Export Plates to CSV")
-        }
-    }
-
-    // Confirmation Dialog
-    if (showConfirmationDialog) {
-        AlertDialog(
-            onDismissRequest = onDismissConfirmation,
-            title = { Text("Is this the correct plate number?") },
-            text = {
-                Column {
-                    Text("Detected: $detectedText")
-                    Spacer(modifier = Modifier.height(8.dp))
-                    OutlinedTextField(
-                        value = correctedText,
-                        onValueChange = onCorrectedTextChange,
-                        label = { Text("Correct if needed") }
-                    )
-                }
-            },
-            confirmButton = {
-                Button(onClick = { onConfirmText(correctedText) }) {
-                    Text("Confirm")
-                }
-            },
-            dismissButton = {
-                Button(onClick = onDismissConfirmation) {
-                    Text("Retake")
-                }
-            }
-        )
-    }
-
-    // Label Dialog
-    if (showLabelDialog) {
-        AlertDialog(
-            onDismissRequest = onDismissLabel,
-            title = { Text("Add a label for this plate") },
-            text = {
-                OutlinedTextField(
-                    value = labelText,
-                    onValueChange = onLabelTextChange,
-                    label = { Text("Label") }
-                )
-            },
-            confirmButton = {
-                Button(onClick = { onConfirmLabel(labelText) }) {
-                    Text("Save")
-                }
-            },
-            dismissButton = {
-                Button(onClick = onDismissLabel) {
-                    Text("Cancel")
-                }
-            }
-        )
-    }
-
-    // Success Dialog
-    if (showSuccessDialog) {
-        AlertDialog(
-            onDismissRequest = onDismissSuccess,
-            title = { Text("Success!") },
-            text = { Text("Plate number '${correctedText}' saved with label: $labelText") },
-            confirmButton = {
-                Button(onClick = onDismissSuccess) {
-                    Text("OK")
-                }
-            }
-        )
-    }
-
-    // Existing Label Dialog
-    if (showExistingLabelDialog) {
-        AlertDialog(
-            onDismissRequest = onDismissExistingLabel,
-            title = { Text("Plate already exists!") },
-            text = { Text("Plate number '${correctedText}' already exists with label: $existingPlateLabel") },
-            confirmButton = {
-                Button(onClick = onDismissExistingLabel) {
-                    Text("OK")
-                }
-            }
-        )
-    }
-
-    // Pass the PreviewView to startCamera
-    LaunchedEffect(Unit) {
-        (context as MainActivity).startCamera(previewView)
+        database.close()
     }
 }

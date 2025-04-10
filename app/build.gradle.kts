@@ -1,91 +1,102 @@
 plugins {
-    id("com.android.application")
-    id("org.jetbrains.kotlin.android")
-    id("kotlin-kapt") // Required for Room Database
-    id("org.jetbrains.kotlin.plugin.compose")
+    // Use aliases from libs.versions.toml
+    alias(libs.plugins.android.application)
+    alias(libs.plugins.kotlin.android)
+    kotlin("kapt")
+//    alias(libs.plugins.kotlin.kapt)
+    // KSP or kapt for Room Compiler if needed
+    // id("com.google.devtools.ksp") version "..."
 }
 
 android {
-    lint {
-        disable.add("MutableCollectionMutableState")
-    }
     namespace = "com.example.plateocr"
-    compileSdk = 34
+    compileSdk = 34 // Or your target SDK
 
     defaultConfig {
         applicationId = "com.example.plateocr"
-        minSdk = 21
+        minSdk = 24 // Or your min SDK
         targetSdk = 34
         versionCode = 1
         versionName = "1.0"
 
+        multiDexEnabled = true
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        javaCompileOptions {
-            annotationProcessorOptions {
-                arguments += mapOf("room.schemaLocation" to "$projectDir/schemas".toString())
-            }
-    }
-
-    buildTypes {
-        release {
-            isMinifyEnabled = false
-            proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+        vectorDrawables {
+            useSupportLibrary = true
         }
     }
 
+buildTypes {
+        release {
+            isMinifyEnabled = false
+            proguardFiles(
+                getDefaultProguardFile("proguard-android-optimize.txt"),
+                "proguard-rules.pro"
+            )
+        }
+    }
     compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
+        sourceCompatibility = JavaVersion.VERSION_1_8 // Or higher if needed
+        targetCompatibility = JavaVersion.VERSION_1_8 // Or higher if needed
     }
-
     kotlinOptions {
-        jvmTarget = "17"
+        jvmTarget = "1.8" // Or higher if needed
     }
-
     buildFeatures {
-        compose = true // Enable Jetpack Compose
+        compose = true // Enable Compose feature
     }
-
     composeOptions {
-        kotlinCompilerExtensionVersion = "1.5.8" // Match this with your Compose version
+        // Set the Compose Compiler version corresponding to your Kotlin version
+        kotlinCompilerExtensionVersion = libs.versions.composeCompiler.get()
     }
-}
+    packaging {
+        resources {
+            excludes += "/META-INF/{AL2.0,LGPL2.1}"
+        }
+    }
 }
 
 dependencies {
-    // Core Android dependencies
-    implementation("androidx.core:core-ktx:1.12.0")
-    implementation("androidx.appcompat:appcompat:1.6.1")
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
 
-    // Jetpack Compose
-    implementation("androidx.activity:activity-compose:1.8.2")
-    implementation("androidx.compose.ui:ui:1.5.4")
-    implementation("androidx.compose.material:material:1.5.4")
-    implementation("androidx.compose.ui:ui-tooling-preview:1.5.4")
-    implementation("androidx.compose.material3:material3:1.1.2")
-    debugImplementation("androidx.compose.ui:ui-tooling:1.5.4")
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.multidex)
 
-    // CameraX dependencies
-    implementation("androidx.camera:camera-core:1.3.0")
-    implementation("androidx.camera:camera-camera2:1.3.0")
-    implementation("androidx.camera:camera-lifecycle:1.3.0")
-    implementation("androidx.camera:camera-view:1.3.0") // Updated to the latest stable version
+    // Compose - Import the BOM
+    implementation(platform(libs.androidx.compose.bom))
+    implementation(libs.androidx.activity.compose) // Use BOM version
+    implementation(libs.androidx.ui)               // Use BOM version
+    implementation(libs.androidx.ui.graphics)        // Use BOM version
+    implementation(libs.androidx.ui.tooling.preview) // Use BOM version
+    implementation(libs.androidx.material3)         // Use BOM version
+    implementation(libs.androidx.material.icons.extended) // Use BOM version
 
-    // ML Kit for OCR
-    implementation("com.google.mlkit:text-recognition:16.0.0")
+    // CameraX
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
 
-    // Room Database
-    implementation("androidx.room:room-runtime:2.6.1")
-    kapt("androidx.room:room-compiler:2.6.1")
-    implementation("androidx.room:room-ktx:2.6.1")
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.androidx.lifecycle.viewmodel.savedstate)
 
-    // Coroutines
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    // Room
+    implementation(libs.androidx.room.runtime)
+    implementation(libs.androidx.room.ktx)
+    kapt(libs.androidx.room.compiler)
 
-    // Testing dependencies
-    testImplementation("junit:junit:4.13.2")
-    androidTestImplementation("androidx.test.ext:junit:1.1.5")
-    androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
-    androidTestImplementation("androidx.compose.ui:ui-test-junit4:1.5.4")
+    // Use annotationProcessor or ksp for the compiler
+    // annotationProcessor(libs.androidx.room.compiler)
+    // or ksp(libs.androidx.room.compiler)
+
+    // ML Kit
+    implementation(libs.mlkit.text.recognition)
+
+    // Testing
+    testImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.androidx.espresso.core)
+    androidTestImplementation(platform(libs.androidx.compose.bom)) // BOM for test dependencies too
+    androidTestImplementation(libs.androidx.compose.ui.test.junit4) // Use BOM version
+    debugImplementation(libs.androidx.ui.tooling)               // Use BOM version
+    debugImplementation(libs.androidx.compose.ui.test.manifest) // Use BOM version
 }
