@@ -16,4 +16,7 @@ interface PlateDao {
 
     @Query("SELECT * FROM plates WHERE number = :number LIMIT 1")
     suspend fun getPlateByNumber(number: String): Plate?
+
+    @Query("SELECT COUNT(*) FROM plates")
+    suspend fun getPlateCount(): Int
 }

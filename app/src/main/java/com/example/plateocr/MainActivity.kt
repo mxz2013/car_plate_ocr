@@ -542,41 +542,101 @@ class MainActivity : ComponentActivity() {
     }
 
     private val restoreDbLauncher = registerForActivityResult(
-        ActivityResultContracts.StartActivityForResult()
-    ) { result ->
-        if (result.resultCode == RESULT_OK) {
-            result.data?.data?.let { uri ->
-                lifecycleScope.launch(Dispatchers.IO) {
-                    try {
-                        database.close()
-                        val dbFile = getDatabasePath("plate_database")
-                        contentResolver.openInputStream(uri)?.use { input ->
-                            FileOutputStream(dbFile).use { output ->
-                                input.copyTo(output)
-                            }
-                        }
-                        database = AppDatabase.getDatabase(this@MainActivity)
-                        plateDao = database.plateDao()
-                        withContext(Dispatchers.Main) {
-                            Toast.makeText(this@MainActivity, "Database restored successfully", Toast.LENGTH_SHORT).show()
-                        }
-                    } catch (e: Exception) {
-                        withContext(Dispatchers.Main) {
-                            Toast.makeText(this@MainActivity, "Restore failed: ${e.message}", Toast.LENGTH_SHORT).show()
-                        }
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri == null) {
+            Toast.makeText(this, "Restore cancelled", Toast.LENGTH_SHORT).show()
+            return@registerForActivityResult
+        }
+
+        // Create progress dialog using AlertDialog.Builder
+        val progressDialog = AlertDialog.Builder(this)
+            .setTitle("Restoring Database")
+            .setMessage("Please wait while restoring your data...")
+            .setCancelable(false)
+            .create()
+
+        progressDialog.show()
+
+        lifecycleScope.launch(Dispatchers.IO) {
+            try {
+                // Verify backup file
+                val backupSize = contentResolver.openFileDescriptor(uri, "r")?.use { fd ->
+                    fd.statSize
+                } ?: throw IOException("Invalid backup file")
+
+                if (backupSize <= 0) {
+                    throw IOException("Backup file is empty")
+                }
+
+                Log.d("RestoreDB", "Starting restore from backup (size: $backupSize bytes)")
+
+                // Close current database
+                database.close()
+
+                // Get target database file
+                val dbFile = getDatabasePath("plate_database") // Update with your actual DB name
+                Log.d("RestoreDB", "Target DB path: ${dbFile.absolutePath}")
+
+                // Delete existing database if it exists
+                if (dbFile.exists()) {
+                    if (!dbFile.delete()) {
+                        throw IOException("Failed to delete existing database")
                     }
+                }
+
+                // Copy backup to database location
+                contentResolver.openInputStream(uri)?.use { input ->
+                    FileOutputStream(dbFile).use { output ->
+                        input.copyTo(output)
+                        output.flush()
+                    }
+                } ?: throw IOException("Could not open backup file")
+
+                // Verify restored database
+                if (!dbFile.exists() || dbFile.length() <= 0) {
+                    throw IOException("Restored database is invalid")
+                }
+
+                // Reinitialize database
+                database = AppDatabase.getDatabase(this@MainActivity)
+                plateDao = database.plateDao()
+
+                // Verify data was restored
+                val plateCount = plateDao.getPlateCount()
+                Log.d("RestoreDB", "Restore complete. Plate count: $plateCount")
+
+                withContext(Dispatchers.Main) {
+                    progressDialog.dismiss()
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Database restored successfully ($plateCount plates)",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            } catch (e: Exception) {
+                Log.e("RestoreDB", "Restore failed", e)
+
+                // Ensure we have a working database even after failure
+                database = AppDatabase.getDatabase(this@MainActivity)
+                plateDao = database.plateDao()
+
+                withContext(Dispatchers.Main) {
+                    progressDialog.dismiss()
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Restore failed: ${e.message}",
+                        Toast.LENGTH_LONG
+                    ).show()
                 }
             }
         }
     }
 
     private fun restoreDatabase() {
-        Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = "*/*"  // Allow all file types so user can choose any file
-        }.also { restoreDbLauncher.launch(it) }
+        // For OpenDocument contract, we pass array of MIME types
+        restoreDbLauncher.launch(arrayOf("application/x-sqlite3", "application/octet-stream"))
     }
-
 
     override fun onDestroy() {
         super.onDestroy()
